@@ -1,4 +1,4 @@
-# scheduler_with_wash.py
+# scheduler_with_wash_fixed.py
 
 import re
 import collections
@@ -19,32 +19,32 @@ def extract_args(line: str):
     """Возвращает список кортежей (str_val, num_val) для всех аргументов."""
     return re.findall(r"'([^']*)'|([-+]?[0-9]*\.?[0-9]+)", line)
 
+
 class ProductionScheduler:
     def __init__(self,
                  data_file: str,
-                 planning_horizon: int = 24,
-                 wash_duration_slots: int = 0,
-                 max_simultaneous_washes: int = 5,
+                 planning_horizon: int = 50,
+                 max_chunks_per_line = 3,
+                 wash_duration_slots: int = 1,
+                 min_chunk_slots: int = 1,
+                 max_chunk_slots: int = 4,
                  default_demand: int = 10000,
                  default_penalty: int = 1,
-                 time_limit_seconds: int = 600,
-                 num_threads: int = 6,
-                 max_chunks_per_line = 4):
+                 time_limit_seconds: int = 120,
+                 num_threads: int = 6):
 
-        self.QUANTUM = 3600 # сколько секунд в слоте
-        
+        self.QUANTUM = 3600  # сколько секунд в слоте
+
         # Параметры расписания
         self.data_file = data_file
         self.horizon = planning_horizon                        # максимальный доступный нам слот времени
-        self.wash_duration = wash_duration_slots               # время в слотах мойки/обслуживания и проч.
-        self.max_simultaneous_washes = max_simultaneous_washes # какое максимальное количество обслуживаний можно соверашть в один момент, суть - количество обслуживающих машин
-        self.default_demand = default_demand                   # масса продукта, требуемая к производству; базово одинакова для всех, но ниже можно настроить для каждого
-        self.default_penalty = default_penalty                 # стоимость/ценность товара; тоже базовая(хотя это имеет мало смысла), тоже можно настроить для каждого
+        self.default_wash_duration = wash_duration_slots       # базовая длина мойки между парой продуктов
+        self.default_demand = default_demand                   # масса продукта, требуемая к производству
+        self.default_penalty = default_penalty                 # стоимость/ценность товара
         self.time_limit = time_limit_seconds                   # ограничение сверху на работу солвера
-        self.num_threads = num_threads                         # количество потоков при решении\
-        self.max_chunks_per_line = max_chunks_per_line         # максимальное количество активных интервалов производства на линии, отображает максимальное количество переключнй
-        #self.max_chunks_per_line = ceil(self.horizon/(self.wash_duration + self.no_switch_slots))
-        
+        self.num_threads = num_threads                         # количество потоков при решении
+        self.max_chunks_per_line = max_chunks_per_line         # максимальное кол-во активных интервалов на линии
+
         # Данные (заполняется load_data)
         self.line_ids = []          # список линий
         self.boiler_ids = []        # список бойлеров(машин)
@@ -53,9 +53,9 @@ class ProductionScheduler:
         self.line_boiler_map = {}   # линия -> совместимые с ней бойлеры
         self.boiler_sku_map = {}    # продукт -> бойлеры, способные над ним работать
         self.boilers_required = {}  # продукт -> сколько требуется бойлеров для его производства
-        self.no_switch_slots = 0    # количество слотов, в течении которых нельзя переключать производство с одного продукта на другой
-        self.deadlines = {}         # продукт -> время после которого его нельзя производить(тоже регулируется пользователем)
-        
+        self.wash_duration_dict = {}# (некорректо, всегда должно быть постоянным в данной модели)
+
+        self.deadlines = {}         # продукт -> время после которого его нельзя производить
 
         # Переменные CP-SAT
         self.model = cp_model.CpModel()
@@ -68,24 +68,26 @@ class ProductionScheduler:
         self.prod_active = {}    # (продукт, линия) -> BoolVar
         self.prod_interval = {}  # (продукт, линия) -> OptionalIntervalVar
 
-        self.boiler_intervals = []  # (intervalVar, boiler, sku, line, assignBool)
-        self.wash_intervals = []    # (intervalVar, kind, resource, switchBool, startVar)
+        self.boiler_intervals = []
+        self.wash_intervals = []
+
+        self.min_chunk_length = {}
+        self.max_chunk_length = {}
+        self.default_min_chunk = min_chunk_slots
+        self.default_max_chunk = max_chunk_slots
 
         self.production_tasks = []  # (продукт, линия)
         self.max_prod_time = {}     # (продукт, линия) -> int
-        self.boiler_act        = {}
-        self.boiler_start      = {}
-        self.boiler_end        = {}
+        self.boiler_act = {}
+        self.boiler_start = {}
+        self.boiler_end = {}
 
         # Целевая функция
         self.total_produced = {}  # sku -> IntVar
-        self.shortfall  = {}      # sku -> IntVar
-        self.objective_val  = None
+        self.shortfall = {}       # sku -> IntVar
+        self.objective_val = None
 
-
-        self.feasible_skus  = []   # Отфильтрованные SKU
-
-        
+        self.feasible_skus = []   # Отфильтрованные SKU
 
     def load_data(self):
         """Загружает syntetic_data.pl, парсит все параметры и рисует bipartite-graph."""
@@ -134,9 +136,14 @@ class ProductionScheduler:
         self.sku_ids = sorted(raw["skus"])
         self.production_rate = raw["speed"]
         self.line_boiler_map = raw["conn"]
-        self.boiler_sku_map  = raw["prodB"]
-        self.boilers_required= raw["needB"]
+        self.boiler_sku_map = raw["prodB"]
+        self.boilers_required = raw["needB"]
         self.no_switch_slots = raw["noSwitch"]
+
+        for sku in self.sku_ids:
+            self.wash_duration_dict[sku] = self.default_wash_duration
+            self.min_chunk_length[sku] = self.default_min_chunk
+            self.max_chunk_length[sku] = self.default_max_chunk
 
         # Дедлайны по умолчанию = горизонт
         for sku in self.sku_ids:
@@ -148,13 +155,13 @@ class ProductionScheduler:
         G.add_nodes_from(self.sku_ids, bipartite=1)
         for line in self.line_ids:
             for sku in self.sku_ids:
-                if (line,sku) in self.production_rate and \
+                if (line, sku) in self.production_rate and \
                    len(self.line_boiler_map[line] & self.boiler_sku_map[sku]) >= max(1, self.boilers_required[sku]):
                     G.add_edge(line, sku)
         pos = nx.bipartite_layout(G, self.sku_ids)
-        plt.figure(figsize=(8,6))
-        nx.draw_networkx_nodes(G, pos, nodelist=self.line_ids,  node_color="lightblue", label="Lines")
-        nx.draw_networkx_nodes(G, pos, nodelist=self.sku_ids,   node_color="salmon",    label="Skus")
+        plt.figure(figsize=(8, 6))
+        nx.draw_networkx_nodes(G, pos, nodelist=self.line_ids, node_color="lightblue", label="Lines")
+        nx.draw_networkx_nodes(G, pos, nodelist=self.sku_ids, node_color="salmon", label="Skus")
         nx.draw_networkx_labels(G, pos, font_size=9)
         nx.draw_networkx_edges(G, pos, edge_color="gray")
         plt.axis("off")
@@ -162,330 +169,216 @@ class ProductionScheduler:
         plt.title("Совместимость линии и продукта")
         plt.show()
 
-        #print(f"[Load]  Данные и граф за {time.time()-t0:.2f}s")
+        # print(f"[Load]  Данные и граф за {time.time()-t0:.2f}s")
 
     def filter_skus(self):
-        # Оставляем только технически выполнимые SKU
-        t0 = time.time()
         self.feasible_skus = []
         for sku in self.sku_ids:
             for line in self.line_ids:
-                if (line,sku) not in self.production_rate:
+                if (line, sku) not in self.production_rate:
                     continue
-                boilers = [b for b in self.boiler_ids
-                           if b in self.line_boiler_map[line]
-                           and b in self.boiler_sku_map[sku]]
-                if len(boilers) >= max(1, self.boilers_required[sku]):
+                boilers = [
+                    b for b in self.boiler_ids
+                    if b in self.line_boiler_map[line] and b in self.boiler_sku_map.get(sku, set())
+                ]
+                if len(boilers) >= max(1, self.boilers_required.get(sku, 1)):
                     self.feasible_skus.append(sku)
                     break
-        print(f"[Filter] {len(self.feasible_skus)}/{len(self.sku_ids)} очистка невозможных к производству SKU. ") #за {time.time()-t0:.2f}s
-
+        print(f"[Filter] {len(self.feasible_skus)}/{len(self.sku_ids)} очищено невозможных к производству SKU.")
 
     def build_model(self):
         m = cp_model.CpModel()
 
+        # Параметры и словари из объекта
+        H = self.horizon
+        L = self.line_ids
+        B = self.boiler_ids
+        P = self.feasible_skus
+        v = self.production_rate        # {(l, p): скорость}
+        Bl = self.line_boiler_map       # {l: [доступные бойлеры]}
+        Bp = self.boiler_sku_map        # {p: {доступные бойлеры}}
+        Rp_map = self.boilers_required  # {p: R_p}
+        min_chunk = self.default_min_chunk      # delta
+        max_chunk = self.default_max_chunk      # gamma
+        wash_dur = self.default_wash_duration   # w
+        d_map = self.deadlines                  # {p: дедлайн}
+        K = self.max_chunks_per_line
+        demand = self.default_demand            # n_p
+        cost = self.default_penalty             # c_p
 
-        H         = self.horizon
-        lines     = self.line_ids
-        boilers   = self.boiler_ids
-        skus      = self.feasible_skus
-        speed     = self.production_rate
-        lb_map    = self.line_boiler_map
-        bs_map    = self.boiler_sku_map
-        needB     = self.boilers_required
-        no_sw     = self.no_switch_slots
-        wash_sl   = self.wash_duration
-        demand    = self.default_demand
-        penalty   = self.default_penalty
-        max_chunks= self.max_chunks_per_line
-        ddl       = self.deadlines
-
-        # 1) Создаём интервалы для каждой пары (линия, чанк, продукт)
+        # 1) Создаём переменные и интервал для каждого потенциального «чанка» (l, k, p)
         self.iv_lkp = {}
-        for l in lines:
-            for k in range(max_chunks):
-                for p in skus:
-                    # Если линия не может делать этот продукт пропускаем
-                    if speed.get((l,p), 0) == 0:
+        for l in L:
+            for k in range(K):
+                for p in P:
+                    if v.get((l, p), 0) == 0:
                         continue
-                    # Если один минимальный чанк сам больше дедлайна, ничего не влезает
-                    if no_sw > ddl[p]:
-                        continue
-                    # хоть что-то произвели
-                    if no_sw * speed[(l,p)] < 1:
-                        continue
-
-                    # запускаем ли p в чанке (l,k)
-                    x  = m.NewBoolVar(f"x_l{l}_k{k}_p{p}")
-                    # Время старта, длительность и конец
+                    x = m.NewBoolVar(f"x_l{l}_k{k}_p{p}")
                     st = m.NewIntVar(0, H, f"st_l{l}_k{k}_p{p}")
                     dr = m.NewIntVar(0, H, f"dr_l{l}_k{k}_p{p}")
                     en = m.NewIntVar(0, H, f"en_l{l}_k{k}_p{p}")
-                    # Опциональный интервал: если x=1, то [st,st+dr) реально используется
                     iv = m.NewOptionalIntervalVar(st, dr, en, x, f"iv_l{l}_k{k}_p{p}")
 
-                    # Если x=0, то длительность=0
+                    # Если x=0, интервал нулевой: dr=0 и en=st
                     m.Add(dr == 0).OnlyEnforceIf(x.Not())
-                    # Если x=1, длительность ≥ min_chunk
-                    m.Add(dr >= no_sw).OnlyEnforceIf(x)
-                    # Если x=1, конец = старт + длительность
+                    m.Add(en == st).OnlyEnforceIf(x.Not())
+
+                    # Если x=1,  δ <= dr <= γ,  en = st + dr,  en <= дедлайн[p]
+                    m.Add(dr >= min_chunk).OnlyEnforceIf(x)
+                    m.Add(dr <= max_chunk).OnlyEnforceIf(x)
                     m.Add(en == st + dr).OnlyEnforceIf(x)
+                    m.Add(en <= d_map[p]).OnlyEnforceIf(x)
 
-                    self.iv_lkp[(l, k, p)] = (iv, st, dr, en, x)
+                    self.iv_lkp[(l, k, p)] = (x, st, dr, en, iv)
 
-        # 2) запрещаем пустой чанк перед активным чанком,
-        #    чтобы избежать эквивалентных расписаний, сдвинутых влево без смысла.
-        for l in lines:
-            for k in range(1, max_chunks):
-                prev_xs = [
-                    self.iv_lkp[(l, k - 1, p)][4]
-                    for p in skus if (l, k - 1, p) in self.iv_lkp
-                ]
-                curr_xs = [
-                    self.iv_lkp[(l, k, p)][4]
-                    for p in skus if (l, k, p) in self.iv_lkp
-                ]
-                if prev_xs and curr_xs:
-                    m.Add(sum(prev_xs) >= sum(curr_xs))
-
-        # 3) В одном чанке (l,k) производится не более одного продукта p
-        for l in lines:
-            for k in range(max_chunks):
-                xs = [
-                    self.iv_lkp[(l, k, p)][4]
-                    for p in skus if (l, k, p) in self.iv_lkp
-                ]
+        # 2)Sum_p x_{l,p,k} <= 1  — не более одного активного продукта в каждом (l, k)
+        for l in L:
+            for k in range(K):
+                xs = []
+                for p in P:
+                    key = (l, k, p)
+                    if key in self.iv_lkp:
+                        xs.append(self.iv_lkp[key][0])
                 if xs:
                     m.Add(sum(xs) <= 1)
 
-        # 4) Интервалы непересекаются
-        for l in lines:
-            ivs = [
-                iv for (ll, _, _), (iv, *_ ) in self.iv_lkp.items()
-                if ll == l
-            ]
-            if ivs:
-                m.AddNoOverlap(ivs)
+        # 3) Упорядоченность “чанков” по индексу k: Sum_p x_{l,p,k-1} >= Sum_p x_{l,p,k}
+        for l in L:
+            for k in range(1, K):
+                prev_vars = []
+                curr_vars = []
+                for p in P:
+                    key_prev = (l, k - 1, p)
+                    key_curr = (l, k, p)
+                    if key_prev in self.iv_lkp:
+                        prev_vars.append(self.iv_lkp[key_prev][0])
+                    if key_curr in self.iv_lkp:
+                        curr_vars.append(self.iv_lkp[key_curr][0])
+                if prev_vars and curr_vars:
+                    m.Add(sum(prev_vars) >= sum(curr_vars))
 
-        # 5) Назначаем бойлеры к запущенным интервалам
+        # 4) Временной порядок соседних “чанков” на одной линии.
+
+        for l in L:
+            for k in range(K - 1):
+                for p1 in P:
+                    key1 = (l, k, p1)
+                    if key1 not in self.iv_lkp:
+                        continue
+                    x1, st1, dr1, en1, iv1 = self.iv_lkp[key1]
+                    k2 = k + 1
+                    for p2 in P:
+                        key2 = (l, k2, p2)
+                        if key2 not in self.iv_lkp:
+                            continue
+                        x2, st2, dr2, en2, iv2 = self.iv_lkp[key2]
+                        # Теперь независимо от того, p1 == p2 или нет, 
+                        # между концом первого и началом второго вставляем мойку
+                        m.Add(en1 + wash_dur <= st2).OnlyEnforceIf([x1, x2])
+
+        # 5) Назначение бойлеров: y_{b,l,k,p} и ivb для каждого кандидата из доступных бойлеров
         self.ivb = {}
-        for (l, k, p), (iv, st, dr, en, x) in self.iv_lkp.items():
-             #  Собираем список всех бойлеров, которые подходят и линии, и продукту
-            bos = [
-                b for b in lb_map[l]
-                if b in bs_map.get(p, [])
-            ]
-            if not bos:
+        for (l, k, p), (x, st, dr, en, iv) in self.iv_lkp.items():
+            candidates = [b for b in Bl[l] if b in Bp.get(p, set())]
+            if not candidates:
                 continue
-
+            R_p = max(1, Rp_map.get(p, 1))
             picks = []
-            needed = max(1, needB.get(p, 1))
-            for b in bos:
-                y   = m.NewBoolVar(f"y_b{b}_l{l}_k{k}_p{p}")  # бойлер b участвует в этом интервале ровно с теми же st, dr, en, что и линия
-                ivb = m.NewOptionalIntervalVar(st, dr, en, y,
-                                               f"ivb_{b}_l{l}_k{k}_p{p}")
-                m.Add(y <= x) #Если бойлер участвует (y=1), то соответствующий чанк на линии тоже должен быть активен (x=1)
-                self.ivb[(b, l, k, p)] = (ivb, y)
+            for b in candidates:
+                y = m.NewBoolVar(f"y_b{b}_l{l}_k{k}_p{p}")
+                ivb = m.NewOptionalIntervalVar(st, dr, en, y, f"ivb_b{b}_l{l}_k{k}_p{p}")
+                m.Add(y <= x)
+                self.ivb[(b, l, k, p)] = (y, ivb)
                 picks.append(y)
-            #Если чанк x=1 (линия выпускает p), то ровно needed переменных y должны быть=1;
-            # если x=0 (линия простаивает), то все y=0 (ни один бойлер не занят)
-            m.Add(sum(picks) == needed).OnlyEnforceIf(x)
+            # Если x=1, ровно R_p бойлеров; если x=0, ни один
+            m.Add(sum(picks) == R_p).OnlyEnforceIf(x)
             m.Add(sum(picks) == 0).OnlyEnforceIf(x.Not())
 
-        # 6) Непересечение интервалов одного бойлера
-        for b in boilers:
-            ivs_b = [
-                ivb for (bb, _, _, _), (ivb, _) in self.ivb.items()
-                if bb == b
-            ]
+        # 5.1) NoOverlap на интервалах каждого бойлера
+        for b in B:
+            ivs_b = []
+            for (bb, l, k, p), (y, ivb) in self.ivb.items():
+                if bb == b:
+                    ivs_b.append(ivb)
             if ivs_b:
                 m.AddNoOverlap(ivs_b)
 
-        # 7) Мойки на линиях
-        #   Проходим по всем парам интервалов на одной и той же линии l,
-        # в разных чанках k1 < k2, и вставляем мойку, если меняется продукт.
-        wash_intervals = []
-        for l in lines:
-            
-            
-            for k1 in range(max_chunks):#  Перебираем первый чанк (k1, p1)
-                for p1 in skus:
-                    key1 = (l, k1, p1)
-                    if key1 not in self.iv_lkp:  # Если чанк (l, k1) не может содержать продукт p1, пропускаем
-                        continue
-                    iv1, st1, dr1, en1, x1 = self.iv_lkp[key1]
-
-                    for k2 in range(k1 + 1, max_chunks):  # Перебираем второй чанк (k2, p2) с k2 > k1
-                        for p2 in skus:
-                            if p2 == p1: # можно отказаться
-                                continue
-                            key2 = (l, k2, p2)
-                            if key2 not in self.iv_lkp: # Если чанк (l, k2) не может проиизв продукт p2, пропускаем
-                                continue
-                            iv2, st2, dr2, en2, x2 = self.iv_lkp[key2]
-
-                            # Проверяем, нет ли активных чанков между k1 и k2
-
-
-                            if k2 - k1 > 1:
-                                mids = [
-                                    self.iv_lkp[(l, m, pp)][4]
-                                    for m in range(k1 + 1, k2)
-                                    for pp in skus
-                                    if (l, m, pp) in self.iv_lkp
-                                ]
-                                nb = m.NewBoolVar(f"no_act_l{l}_k{k1}_to_{k2}")
-                                if mids:
-                                    m.AddBoolAnd([mid.Not() for mid in mids]).OnlyEnforceIf(nb)
-                                    m.AddBoolOr(mids).OnlyEnforceIf(nb.Not())
-                                else:
-                                    m.Add(nb == 1)
-                            else:
-                                nb = m.NewConstant(1)
-
-                            both_prod = m.NewBoolVar(          # both_prod = оба  включены
-                                f"both_l{l}_k{k1}_{p1}_and_k{k2}_{p2}"
-                            )
-                            m.AddBoolAnd([x1, x2]).OnlyEnforceIf(both_prod)
-                            m.AddBoolOr([x1.Not(), x2.Not()]).OnlyEnforceIf(both_prod.Not())
-
-                            both_adj = m.NewBoolVar( # both_adj = оба запущены и между ними нет активных чанков»
-                                f"both_adj_l{l}_k{k1}_{p1}_k{k2}_{p2}"
-                            )
-
-                            # Дальше создаем интервал мойки...
-                            m.AddBoolAnd([both_prod, nb]).OnlyEnforceIf(both_adj)
-                            m.AddBoolOr([both_prod.Not(), nb.Not()]).OnlyEnforceIf(both_adj.Not())
-
-                            order = m.NewBoolVar(
-                                f"order_l{l}_{k1}_{p1}_to_{k2}_{p2}"
-                            )
-                            stw = m.NewIntVar(
-                                0, H, f"stw_line_{l}_{k1}_{p1}_to_{k2}_{p2}"
-                            )
-                            enw = m.NewIntVar(
-                                0, H, f"enw_line_{l}_{k1}_{p1}_to_{k2}_{p2}"
-                            )
-                            ivw = m.NewOptionalIntervalVar(
-                                stw, wash_sl, enw, both_adj,
-                                f"wash_line_{l}_{k1}_{p1}_{k2}_{p2}"
-                            )
-                            m.Add(enw == stw + wash_sl).OnlyEnforceIf(both_adj)
-
-                            #p1 -> мойка -> p2
-
-                            m.Add(iv1.EndExpr() + wash_sl <= iv2.StartExpr()
-                                  ).OnlyEnforceIf([both_adj, order])
-                            m.Add(stw >= iv1.EndExpr()
-                                  ).OnlyEnforceIf([both_adj, order])
-                            m.Add(enw <= iv2.StartExpr()
-                                  ).OnlyEnforceIf([both_adj, order])
+        # 5.2) Мойка на бойлерах (параллельные интервалы):
+        #      для каждой неупорядоченной пары (i,j)
+        #      вводим порядок через булев z и оба варианта порядка через \beta.
+        for b in B:
+            items = [(y, ivb, p) for (bb, l, k, p), (y, ivb) in self.ivb.items() if bb == b]
+            n_items = len(items)
+            if n_items < 2:
+                continue
+            for i in range(n_items):
+                y1, ivb1, p1 = items[i]
+                start1 = ivb1.StartExpr()
+                end1 = ivb1.EndExpr()
+                for j in range(i + 1, n_items):
+                    y2, ivb2, p2 = items[j]
+                    start2 = ivb2.StartExpr()
+                    end2 = ivb2.EndExpr()
+                    # Всегда ставим мойку wash_dur между концами независимо от  соседства
+                    zB = m.NewBoolVar(f"zB_b{b}_i{i}_j{j}_p{p1}_p{p2}")
+                    # zB = 1 \Leftrightarrow оба этих интервала реально активны одновременно
+                    m.AddBoolAnd([y1, y2]).OnlyEnforceIf(zB)
+                    m.AddBoolOr([y1.Not(), y2.Not()]).OnlyEnforceIf(zB.Not())
+                    beta = m.NewBoolVar(f"beta_b{b}_i{i}_j{j}_p{p1}_p{p2}")
+                    # Первый приходит раньше -> end1 + wash_dur <= start2
+                    m.Add(end1 + wash_dur <= start2).OnlyEnforceIf([zB, beta])
+                    # Второй приходит раньше -> end2 + wash_dur <= start1
+                    m.Add(end2 + wash_dur <= start1).OnlyEnforceIf([zB, beta.Not()])
 
 
-                            #p2 -> мойка -> p1бб
-
-                            m.Add(iv2.EndExpr() + wash_sl <= iv1.StartExpr()
-                                  ).OnlyEnforceIf([both_adj, order.Not()])
-                            m.Add(stw >= iv2.EndExpr()
-                                  ).OnlyEnforceIf([both_adj, order.Not()])
-                            m.Add(enw <= iv1.StartExpr()
-                                  ).OnlyEnforceIf([both_adj, order.Not()])
-
-                            wash_intervals.append(ivw)
-
-        # 8) Мойки на бойлерах 
-        for b in boilers:
-            prods = [
-                (ln, ch, pr, ivb, y)
-                for (bb, ln, ch, pr), (ivb, y) in self.ivb.items()
-                if bb == b
-            ]
-            for i in range(len(prods)):
-                l1, k1, p1, ivb1, y1 = prods[i]
-                for j in range(i + 1, len(prods)):
-                    l2, k2, p2, ivb2, y2 = prods[j]
-                    if p2 == p1:
-                        continue
-
-                    seq_min = no_sw + wash_sl + no_sw
-                    cant_12 = (seq_min > ddl[p2])
-                    cant_21 = (seq_min > ddl[p1])
-                    if cant_12 and cant_21:
-                        m.Add(y1 + y2 <= 1)
-                        continue
-
-                    both_prod_b = m.NewBoolVar(
-                        f"bothb_{b}_{l1}_{k1}_{p1}_to_{l2}_{k2}_{p2}"
-                    )
-                    m.AddBoolAnd([y1, y2]).OnlyEnforceIf(both_prod_b)
-                    m.AddBoolOr([y1.Not(), y2.Not()]).OnlyEnforceIf(both_prod_b.Not())
-
-                    orderb = m.NewBoolVar(
-                        f"order_b{b}_{l1}_{k1}_{p1}_to_{l2}_{k2}_{p2}"
-                    )
-                    stwb = m.NewIntVar(
-                        0, H,
-                        f"stw_boiler_{b}_{l1}_{k1}_{p1}_{l2}_{k2}_{p2}"
-                    )
-                    enwb = m.NewIntVar(
-                        0, H,
-                        f"enw_boiler_{b}_{l1}_{k1}_{p1}_{l2}_{k2}_{p2}"
-                    )
-                    ivwb = m.NewOptionalIntervalVar(
-                        stwb, wash_sl, enwb, both_prod_b,
-                        f"wash_boiler_{b}_{l1}_{k1}_{p1}_to_{l2}_{k2}_{p2}"
-                    )
-                    m.Add(enwb == stwb + wash_sl).OnlyEnforceIf(both_prod_b)
-
-                    m.Add(ivb1.EndExpr() + wash_sl <= ivb2.StartExpr()
-                          ).OnlyEnforceIf([both_prod_b, orderb])
-                    m.Add(stwb >= ivb1.EndExpr()
-                          ).OnlyEnforceIf([both_prod_b, orderb])
-                    m.Add(enwb <= ivb2.StartExpr()
-                          ).OnlyEnforceIf([both_prod_b, orderb])
-
-                    m.Add(ivb2.EndExpr() + wash_sl <= ivb1.StartExpr()
-                          ).OnlyEnforceIf([both_prod_b, orderb.Not()])
-                    m.Add(stwb >= ivb2.EndExpr()
-                          ).OnlyEnforceIf([both_prod_b, orderb.Not()])
-                    m.Add(enwb <= ivb1.StartExpr()
-                          ).OnlyEnforceIf([both_prod_b, orderb.Not()])
-
-                    wash_intervals.append(ivwb)
-
-        # 9) Ограничение на одновременную мойку
-        if wash_intervals:
-            m.AddCumulative(wash_intervals, [1] * len(wash_intervals), self.max_simultaneous_washes)
-
-        # 10) Целевая функция
+        # 6) Целевая функция
         terms = []
-        for p in skus:
-            vols = []
-            for (l, k, pp), (iv, st, dr, en, run_var) in self.iv_lkp.items():
+        self.q_vars = {}
+        self.short_vars = {}
+
+        # Предварительно считаем макс. возможный объём для каждого p
+        max_volumes = {}
+        for p in P:
+            total = 0
+            for (l, k, pp) in self.iv_lkp:
+                if pp == p:
+                    total += v.get((l, p), 0) * max_chunk
+            max_volumes[p] = total if total > 0 else 0
+
+        for p in P:
+            # 6.1) Собираем объёмы = rate * (en - st) для всех (l,k,p)
+            volumes_for_p = []
+            for (l, k, pp), (x, st, dr, en, iv) in self.iv_lkp.items():
                 if pp != p:
                     continue
-                vols.append(dr * speed[(l, p)])
-            prod  = m.NewIntVar(0, demand, f"prod_{p}")
-            short = m.NewIntVar(0, demand, f"short_{p}")
-            m.Add(prod == sum(vols))
-            m.Add(short >= demand - prod)
-            terms.append(short * penalty)
+                rate = v.get((l, p), 0)
+                # en - st = dr при x=1, иначе 0
+                volumes_for_p.append(rate * (en - st))
+
+            # 6.2) q_p 
+            q_p = m.NewIntVar(0, max_volumes[p], f"q_{p}")
+            m.Add(q_p == sum(volumes_for_p))
+
+            # 6.3) short_p 
+            short_p = m.NewIntVar(0, demand, f"short_{p}")
+            m.Add(short_p >= demand - q_p)
+
+            self.q_vars[p] = q_p
+            self.short_vars[p] = short_p
+
+            # 6.4) Добавляем штраф cost * short_p
+            terms.append(short_p * cost)
+
+        print(f"[Build]  Модель построена")
         m.Minimize(sum(terms))
-
         self.model = m
-
-        print("[Build] Модель построена.")
-
-
-
-
-
+        
 
     def solve(self):
         t0 = time.time()
         self.solver = cp_model.CpSolver()
         self.solver.parameters.max_time_in_seconds = self.time_limit
-        self.solver.parameters.num_search_workers   = self.num_threads
+        self.solver.parameters.num_search_workers = self.num_threads
         status = self.solver.Solve(self.model)
         self.objective_val = self.solver.ObjectiveValue()
         print(f"[Solve]  Status: {self.solver.StatusName(status)}, "
@@ -493,80 +386,91 @@ class ProductionScheduler:
               f"time={time.time()-t0:.2f}s")
 
     def plot_gantt(self):
-        import matplotlib.pyplot as plt
-        import itertools
-
         solver = self.solver
-        H      = self.horizon
-        wash   = self.wash_duration    # ← вот здесь: правильно берем длительность мойки
+        H = self.horizon
+        wash = self.default_wash_duration  # длительность мойки
 
-        # Вертикальные позиции
-        y_line   = {l: i for i, l in enumerate(self.line_ids)}
+        # Вертикальные позиции для линий и бойлеров
+        y_line = {l: i for i, l in enumerate(self.line_ids)}
         y_boiler = {b: i for i, b in enumerate(self.boiler_ids)}
 
         fig, (axL, axB) = plt.subplots(2, 1, sharex=True, figsize=(16, 10))
-        palette   = itertools.cycle(plt.rcParams["axes.prop_cycle"].by_key()["color"])
+        palette = itertools.cycle(plt.rcParams["axes.prop_cycle"].by_key()["color"])
         color_map = {}
 
         def draw_block(ax, y, start, dur, sku):
             c = color_map.setdefault(sku, next(palette))
             ax.barh(y, dur, left=start, height=0.6, color=c, edgecolor="black")
-            ax.text(start + dur/2, y, str(sku),
+            ax.text(start + dur / 2, y, str(sku),
                     ha="center", va="center", color="white", fontsize=8)
 
-        # 1) Production on Lines + washes
+        # 1) Производство на линиях с мойками
         for l in self.line_ids:
             tasks = []
-            for (ll, k, p), (iv, _, _, _, x) in self.iv_lkp.items():
+            for (ll, k, p), tup in self.iv_lkp.items():
+                x, st, dr, en, iv = tup
                 if ll == l and solver.Value(x):
-                    s = solver.Value(iv.StartExpr())
-                    d = solver.Value(iv.SizeExpr())
+                    s = solver.Value(st)
+                    d = solver.Value(dr)
                     tasks.append((s, d, p))
             tasks.sort(key=lambda t: t[0])
+
+            # Рисуем продукцию на линиях
             for s, d, p in tasks:
                 draw_block(axL, y_line[l], s, d, p)
-            for (s1, d1, _), (s2, d2, _) in zip(tasks, tasks[1:]):
-                gap = s2 - (s1 + d1)
-                if gap >= wash:
-                    axL.barh(y_line[l], wash,
-                             left=s1 + d1,
-                             height=0.3,
-                             color="gray", alpha=0.5)
+
+            # Рисуем мойку (серый прямоугольник) когда gap >= wash
+            if len(tasks) > 1:
+                for (s1, d1, _), (s2, d2, _) in zip(tasks, tasks[1:]):
+                    gap = s2 - (s1 + d1)
+                    if gap >= wash:
+                        axL.barh(
+                            y_line[l],
+                            wash,
+                            left=s1 + d1,
+                            height=0.3,
+                            color="gray",
+                            alpha=0.5
+                        )
 
         axL.set_yticks(list(y_line.values()))
         axL.set_yticklabels(self.line_ids)
         axL.set_xlim(0, H)
-        axL.set_title("Диаграмма Ганта производства по линиям, серый - мойка")
+        axL.set_title("Диаграмма Ганта: линии (серый = мойка)")
 
-        # 2) Production on Boilers + washes
+        # 2) Производство на бойлерах с мойками
         for b in self.boiler_ids:
             tasks = []
-            for (bb, l, k, p), (ivb, y) in self.ivb.items():
+            for (bb, l, k, p), (y, ivb) in self.ivb.items():
                 if bb == b and solver.Value(y):
                     s = solver.Value(ivb.StartExpr())
                     d = solver.Value(ivb.SizeExpr())
                     tasks.append((s, d, p))
             tasks.sort(key=lambda t: t[0])
+
+            # Рисуем продукцию на бойлерах
             for s, d, p in tasks:
                 draw_block(axB, y_boiler[b], s, d, p)
-            for (s1, d1, _), (s2, d2, _) in zip(tasks, tasks[1:]):
-                gap = s2 - (s1 + d1)
-                if gap >= wash:
-                    axB.barh(y_boiler[b], wash,
-                             left=s1 + d1,
-                             height=0.3,
-                             color="gray", alpha=0.5)
+
+            # Рисуем мойку (серый прямоугольник) когда gap >= wash
+            if len(tasks) > 1:
+                for (s1, d1, _), (s2, d2, _) in zip(tasks, tasks[1:]):
+                    gap = s2 - (s1 + d1)
+                    if gap >= wash:
+                        axB.barh(
+                            y_boiler[b],
+                            wash,
+                            left=s1 + d1,
+                            height=0.3,
+                            color="gray",
+                            alpha=0.5
+                        )
 
         axB.set_yticks(list(y_boiler.values()))
         axB.set_yticklabels(self.boiler_ids)
         axB.set_xlim(0, H)
         axB.set_xlabel("Слоты времени")
-        axB.set_title("Диаграмма Ганта производства по бойлерам")
-
-        # 3) Легенда по SKU
-        handles, labels = axL.get_legend_handles_labels()
-        by_label = dict(zip(labels, handles))
-        axL.legend(by_label.values(), by_label.keys(), loc="upper right")
+        axB.set_title("Диаграмма Ганта: бойлеры (серый = мойка)")
 
         plt.tight_layout()
         plt.show()
@@ -583,5 +487,6 @@ def main():
     except Exception:
         traceback.print_exc()
 
-if __name__=="__main__":
+
+if __name__ == "__main__":
     main()
